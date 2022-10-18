@@ -48,7 +48,7 @@ class APNsClient(object):
 
     def __init__(self,
                  credentials: Union[Credentials, str],
-                 use_sandbox: bool = False, use_alternative_port: bool = False, proto: Optional[str] = None,
+                 use_sandbox: bool = False, use_alternative_port: bool = False,
                  json_encoder: Optional[type] = None, password: Optional[str] = None,
                  proxy_host: Optional[str] = None, proxy_port: Optional[int] = None,
                  heartbeat_period: Optional[float] = None) -> None:
@@ -56,36 +56,38 @@ class APNsClient(object):
             self.__credentials = CertificateCredentials(credentials, password)  # type: Credentials
         else:
             self.__credentials = credentials
-        self._init_connection(use_sandbox, use_alternative_port, proto, proxy_host, proxy_port)
+        self._init_connection(use_sandbox, use_alternative_port, proxy_host, proxy_port)
 
-        if heartbeat_period:
-            self._start_heartbeat(heartbeat_period)
+        # TODO: Heartbeat
+        # if heartbeat_period:
+        #     self._start_heartbeat(heartbeat_period)
 
         self.__json_encoder = json_encoder
         self.__max_concurrent_streams = 0
         self.__previous_server_max_concurrent_streams = None
 
-    def _init_connection(self, use_sandbox: bool, use_alternative_port: bool, proto: Optional[str],
+    def _init_connection(self, use_sandbox: bool, use_alternative_port: bool,
                          proxy_host: Optional[str], proxy_port: Optional[int]) -> None:
         server = self.SANDBOX_SERVER if use_sandbox else self.LIVE_SERVER
         port = self.ALTERNATIVE_PORT if use_alternative_port else self.DEFAULT_PORT
-        self._connection = self.__credentials.create_connection(server, port, proto, proxy_host, proxy_port)
+        self._connection = self.__credentials.create_connection(server, port, proxy_host, proxy_port)
 
-    def _start_heartbeat(self, heartbeat_period: float) -> None:
-        conn_ref = weakref.ref(self._connection)
-
-        def watchdog() -> None:
-            while True:
-                conn = conn_ref()
-                if conn is None:
-                    break
-
-                conn.ping('-' * 8)
-                time.sleep(heartbeat_period)
-
-        thread = Thread(target=watchdog)
-        thread.setDaemon(True)
-        thread.start()
+    # TODO: Heartbeat
+    # def _start_heartbeat(self, heartbeat_period: float) -> None:
+    #     conn_ref = weakref.ref(self._connection)
+    #
+    #     def watchdog() -> None:
+    #         while True:
+    #             conn = conn_ref()
+    #             if conn is None:
+    #                 break
+    #
+    #             conn.ping('-' * 8)
+    #             time.sleep(heartbeat_period)
+    #
+    #     thread = Thread(target=watchdog)
+    #     thread.setDaemon(True)
+    #     thread.start()
 
     def send_notification(self, token_hex: str, notification: Payload, topic: Optional[str] = None,
                           priority: NotificationPriority = NotificationPriority.Immediate,
@@ -98,6 +100,7 @@ class APNsClient(object):
                 raise exception_class_for_reason(reason)(info)
             else:
                 raise exception_class_for_reason(result)
+        return result
 
     def send_notification_async(self, token_hex: str, notification: Payload, topic: Optional[str] = None,
                                 priority: NotificationPriority = NotificationPriority.Immediate,
@@ -146,24 +149,24 @@ class APNsClient(object):
             headers['apns-collapse-id'] = collapse_id
 
         url = '/3/device/{}'.format(token_hex)
-        stream_id = self._connection.request('POST', url, json_payload, headers)  # type: int
-        return stream_id
+        response = self._connection.post(url, content=json_payload, headers=headers)  # type: int
+        return response
 
-    def get_notification_result(self, stream_id: int) -> Union[str, Tuple[str, str]]:
+    def get_notification_result(self, response) -> Union[str, Tuple[str, str]]:
         """
         Get result for specified stream
         The function returns: 'Success' or 'failure reason' or ('Unregistered', timestamp)
         """
-        with self._connection.get_response(stream_id) as response:
-            if response.status == 200:
-                return 'Success'
+        if response.status_code == 200:
+            return 'Success'
+        else:
+            # raw_data = response.read().decode('utf-8')
+            raw_data = response.text
+            data = json.loads(raw_data)  # type: Dict[str, str]
+            if response.status == 410:
+                return data['reason'], data['timestamp']
             else:
-                raw_data = response.read().decode('utf-8')
-                data = json.loads(raw_data)  # type: Dict[str, str]
-                if response.status == 410:
-                    return data['reason'], data['timestamp']
-                else:
-                    return data['reason']
+                return data['reason']
 
     def send_notification_batch(self, notifications: Iterable[Notification], topic: Optional[str] = None,
                                 priority: NotificationPriority = NotificationPriority.Immediate,
@@ -184,9 +187,6 @@ class APNsClient(object):
         """
         notification_iterator = iter(notifications)
         next_notification = next(notification_iterator, None)
-        # Make sure we're connected to APNs, so that we receive and process the server's SETTINGS
-        # frame before starting to send notifications.
-        self.connect()
 
         results = {}
         open_streams = collections.deque()  # type: typing.Deque[RequestStream]
@@ -218,6 +218,7 @@ class APNsClient(object):
 
         return results
 
+    # TODO: 
     def update_max_concurrent_streams(self) -> None:
         # Get the max_concurrent_streams setting returned by the server.
         # The max_concurrent_streams value is saved in the H2Connection instance that must be
@@ -243,23 +244,3 @@ class APNsClient(object):
         else:
             logger.info('APNs set max_concurrent_streams to %s', max_concurrent_streams)
             self.__max_concurrent_streams = max_concurrent_streams
-
-    def connect(self) -> None:
-        """
-        Establish a connection to APNs. If already connected, the function does nothing. If the
-        connection fails, the function retries up to MAX_CONNECTION_RETRIES times.
-        """
-        retries = 0
-        while retries < MAX_CONNECTION_RETRIES:
-            # noinspection PyBroadException
-            try:
-                self._connection.connect()
-                logger.info('Connected to APNs')
-                return
-            except Exception:  # pylint: disable=broad-except
-                # close the connnection, otherwise next connect() call would do nothing
-                self._connection.close()
-                retries += 1
-                logger.exception('Failed connecting to APNs (attempt %s of %s)', retries, MAX_CONNECTION_RETRIES)
-
-        raise ConnectionFailed()

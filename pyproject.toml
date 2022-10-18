@@ -25,8 +25,8 @@ classifiers = [
 [tool.poetry.dependencies]
 python = ">=3.7"
 cryptography = ">=1.7.2"
-hyper = ">=0.7"
 pyjwt = ">=2.0.0"
+httpx = {extras = ["http2"], version = ">=0.23.0"}
 
 [tool.poetry.dev-dependencies]
 pytest = "*"

@@ -4,11 +4,10 @@ from base64 import b64decode
 
 import jwt
 
-from hyper import HTTP20Connection  # type: ignore
-from hyper.tls import init_context  # type: ignore
+from httpx import Client, URL, create_ssl_context
 
 if TYPE_CHECKING:
-    from hyper.ssl_compat import SSLContext  # type: ignore
+    from ssl import SSLContext
 
 DEFAULT_TOKEN_LIFETIME = 2700
 DEFAULT_TOKEN_ENCRYPTION_ALGORITHM = 'ES256'
@@ -16,16 +15,21 @@ DEFAULT_TOKEN_ENCRYPTION_ALGORITHM = 'ES256'
 
 # Abstract Base class. This should not be instantiated directly.
 class Credentials(object):
-    def __init__(self, ssl_context: 'Optional[SSLContext]' = None) -> None:
+    def __init__(self, ssl_context: 'Optional[str, SSLContext]' = None) -> None:
         super().__init__()
         self.__ssl_context = ssl_context
 
     # Creates a connection with the credentials, if available or necessary.
-    def create_connection(self, server: str, port: int, proto: Optional[str], proxy_host: Optional[str] = None,
-                          proxy_port: Optional[int] = None) -> HTTP20Connection:
-        # self.__ssl_context may be none, and that's fine.
-        return HTTP20Connection(server, port, ssl_context=self.__ssl_context, force_proto=proto or 'h2',
-                                secure=True, proxy_host=proxy_host, proxy_port=proxy_port)
+    def create_connection(self, server: str, port: int, proxy_host: Optional[str] = None,
+                          proxy_port: Optional[int] = None) -> Client:
+        apns_url = URL(host=server, scheme='https', port=port)
+
+        proxies = None
+        if proxy_host is not None:
+            proxy_url = URL(host=proxy_host, scheme='https', port=proxy_port)
+            proxies = { 'all://': proxy_url }
+
+        return Client(verify=self.__ssl_context or True, http1=False, http2=True, proxies=proxies, base_url=apns_url)
 
     def get_authorization_header(self, topic: Optional[str]) -> Optional[str]:
         return None
@@ -35,7 +39,7 @@ class Credentials(object):
 class CertificateCredentials(Credentials):
     def __init__(self, cert_file: Optional[str] = None, password: Optional[str] = None,
                  cert_chain: Optional[str] = None) -> None:
-        ssl_context = init_context(cert=cert_file, cert_password=password)
+        ssl_context = create_ssl_context(cert=(cert_file, None, password))
         if cert_chain:
             ssl_context.load_cert_chain(cert_chain)
         super(CertificateCredentials, self).__init__(ssl_context)
