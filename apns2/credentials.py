@@ -4,7 +4,7 @@ from base64 import b64decode
 
 import jwt
 
-from httpx import Client, URL, create_ssl_context
+from httpx import AsyncClient, URL, create_ssl_context
 
 if TYPE_CHECKING:
     from ssl import SSLContext
@@ -21,7 +21,7 @@ class Credentials(object):
 
     # Creates a connection with the credentials, if available or necessary.
     def create_connection(self, server: str, port: int, proxy_host: Optional[str] = None,
-                          proxy_port: Optional[int] = None) -> Client:
+                          proxy_port: Optional[int] = None) -> AsyncClient:
         apns_url = URL(host=server, scheme='https', port=port)
 
         proxies = None
@@ -29,7 +29,7 @@ class Credentials(object):
             proxy_url = URL(host=proxy_host, scheme='https', port=proxy_port)
             proxies = { 'all://': proxy_url }
 
-        return Client(verify=self.__ssl_context or True, http1=False, http2=True, proxies=proxies, base_url=apns_url)
+        return AsyncClient(verify=self.__ssl_context or True, http1=False, http2=True, proxies=proxies, base_url=apns_url)
 
     def get_authorization_header(self, topic: Optional[str]) -> Optional[str]:
         return None

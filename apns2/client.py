@@ -1,3 +1,4 @@
+import asyncio
 import collections
 import json
 import logging
@@ -29,7 +30,8 @@ class NotificationType(Enum):
     MDM = 'mdm'
 
 
-RequestStream = collections.namedtuple('RequestStream', ['stream_id', 'token'])
+# RequestStream = collections.namedtuple('RequestStream', ['stream_id', 'token'])
+APNResponse = collections.namedtuple('APNResponse', ['status_code', 'token', 'success', 'error'], defaults=[None])
 Notification = collections.namedtuple('Notification', ['token', 'payload'])
 
 DEFAULT_APNS_PRIORITY = NotificationPriority.Immediate
@@ -91,21 +93,22 @@ class APNsClient(object):
 
     def send_notification(self, token_hex: str, notification: Payload, topic: Optional[str] = None,
                           priority: NotificationPriority = NotificationPriority.Immediate,
-                          expiration: Optional[int] = None, collapse_id: Optional[str] = None) -> None:
-        stream_id = self.send_notification_async(token_hex, notification, topic, priority, expiration, collapse_id)
-        result = self.get_notification_result(stream_id)
-        if result != 'Success':
-            if isinstance(result, tuple):
-                reason, info = result
+                          expiration: Optional[int] = None, collapse_id: Optional[str] = None,
+                          push_type: Optional[NotificationType] = None) -> None:
+        notification_coro = self.send_notification_async(token_hex, notification, topic, priority, expiration, collapse_id, push_type)
+        result = asyncio.run(notification_coro)
+        if not result.success:
+            if isinstance(result.error, tuple):
+                reason, info = result.error
                 raise exception_class_for_reason(reason)(info)
             else:
-                raise exception_class_for_reason(result)
+                raise exception_class_for_reason(result.error)
         return result
 
-    def send_notification_async(self, token_hex: str, notification: Payload, topic: Optional[str] = None,
-                                priority: NotificationPriority = NotificationPriority.Immediate,
-                                expiration: Optional[int] = None, collapse_id: Optional[str] = None,
-                                push_type: Optional[NotificationType] = None) -> int:
+    async def send_notification_async(self, token_hex: str, notification: Payload, topic: Optional[str] = None,
+                                      priority: NotificationPriority = NotificationPriority.Immediate,
+                                      expiration: Optional[int] = None, collapse_id: Optional[str] = None,
+                                      push_type: Optional[NotificationType] = None) -> int:
         json_str = json.dumps(notification.dict(), cls=self.__json_encoder, ensure_ascii=False, separators=(',', ':'))
         json_payload = json_str.encode('utf-8')
 
@@ -149,29 +152,38 @@ class APNsClient(object):
             headers['apns-collapse-id'] = collapse_id
 
         url = '/3/device/{}'.format(token_hex)
-        response = self._connection.post(url, content=json_payload, headers=headers)  # type: int
-        return response
+        response = await self._connection.post(url, content=json_payload, headers=headers)  # type: int
+        return self.get_notification_result(response, token_hex)
 
-    def get_notification_result(self, response) -> Union[str, Tuple[str, str]]:
+    def get_notification_result(self, response, token) -> Union[str, Tuple[str, str]]:
         """
         Get result for specified stream
         The function returns: 'Success' or 'failure reason' or ('Unregistered', timestamp)
         """
+        # TODO: Clean this up
+        #       Also improve error handling, return actual error object
         if response.status_code == 200:
-            return 'Success'
+            return APNResponse(response.status_code, token, True)
         else:
             # raw_data = response.read().decode('utf-8')
             raw_data = response.text
             data = json.loads(raw_data)  # type: Dict[str, str]
-            if response.status == 410:
-                return data['reason'], data['timestamp']
-            else:
-                return data['reason']
+            # if response.status == 410:
+            #     return data['reason'], data['timestamp']
+            # else:
+            #     return data['reason']
+            return APNResponse(response.status_code, token, False, data['reason'])
 
     def send_notification_batch(self, notifications: Iterable[Notification], topic: Optional[str] = None,
                                 priority: NotificationPriority = NotificationPriority.Immediate,
                                 expiration: Optional[int] = None, collapse_id: Optional[str] = None,
                                 push_type: Optional[NotificationType] = None) -> Dict[str, Union[str, Tuple[str, str]]]:
+        return asyncio.run(self.send_notification_batch_async(notifications, topic, priority, expiration, collapse_id, push_type))
+
+    async def send_notification_batch_async(self, notifications: Iterable[Notification], topic: Optional[str] = None,
+                                            priority: NotificationPriority = NotificationPriority.Immediate,
+                                            expiration: Optional[int] = None, collapse_id: Optional[str] = None,
+                                            push_type: Optional[NotificationType] = None) -> Dict[str, Union[str, Tuple[str, str]]]:
         """
         Send a notification to a list of tokens in batch. Instead of sending a synchronous request
         for each token, send multiple requests concurrently. This is done on the same connection,
@@ -188,20 +200,29 @@ class APNsClient(object):
         notification_iterator = iter(notifications)
         next_notification = next(notification_iterator, None)
 
-        results = {}
-        open_streams = collections.deque()  # type: typing.Deque[RequestStream]
+        results = []
+        open_streams = set()
+        pending_streams = asyncio.queues.Queue()
+        # open_streams = collections.deque()  # type: typing.Deque[RequestStream]
+
+        def _on_completion(notification_task):
+            open_streams.discard(notification_task)
+            pending_streams.put_nowait(notification_task)
+
         # Loop on the tokens, sending as many requests as possible concurrently to APNs.
         # When reaching the maximum concurrent streams limit, wait for a response before sending
         # another request.
         while len(open_streams) > 0 or next_notification is not None:
             # Update the max_concurrent_streams on every iteration since a SETTINGS frame can be
             # sent by the server at any time.
-            self.update_max_concurrent_streams()
+            # TODO: # self.update_max_concurrent_streams()
             if next_notification is not None and len(open_streams) < self.__max_concurrent_streams:
                 logger.info('Sending to token %s', next_notification.token)
-                stream_id = self.send_notification_async(next_notification.token, next_notification.payload, topic,
-                                                         priority, expiration, collapse_id, push_type)
-                open_streams.append(RequestStream(stream_id, next_notification.token))
+                notification_task = asyncio.create_task(
+                    self.send_notification_async(next_notification.token, next_notification.payload, topic,
+                                                 priority, expiration, collapse_id, push_type))
+                open_streams.add(notification_task)
+                notification_task.add_done_callback(_on_completion)
 
                 next_notification = next(notification_iterator, None)
                 if next_notification is None:
@@ -211,10 +232,10 @@ class APNsClient(object):
                 # We have at least one request waiting for response (otherwise we would have either
                 # sent new requests or exited the while loop.) Wait for the first outstanding stream
                 # to return a response.
-                pending_stream = open_streams.popleft()
-                result = self.get_notification_result(pending_stream.stream_id)
-                logger.info('Got response for %s: %s', pending_stream.token, result)
-                results[pending_stream.token] = result
+                pending_stream = await pending_streams.get()
+                result = pending_stream.result()
+                logger.info('Got response for %s: %s', result.token, "Success" if result.success else result.error)
+                results.append(result)
 
         return results
 
