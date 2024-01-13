@@ -15,6 +15,9 @@ from .errors import ConnectionFailed, exception_class_for_reason
 # keep the old API, where APNsClient took a cert_file
 from .payload import Payload
 
+# TODO: Docstrings
+# TODO: Type Annotations
+# TODO: Tests
 
 class NotificationPriority(Enum):
     Immediate = '10'
@@ -30,13 +33,10 @@ class NotificationType(Enum):
     MDM = 'mdm'
 
 
-# RequestStream = collections.namedtuple('RequestStream', ['stream_id', 'token'])
 APNResponse = collections.namedtuple('APNResponse', ['status_code', 'token', 'success', 'error'], defaults=[None])
 Notification = collections.namedtuple('Notification', ['token', 'payload'])
 
 DEFAULT_APNS_PRIORITY = NotificationPriority.Immediate
-CONCURRENT_STREAMS_SAFETY_MAXIMUM = 1000
-MAX_CONNECTION_RETRIES = 3
 
 logger = logging.getLogger(__name__)
 
@@ -97,12 +97,13 @@ class APNsClient(object):
                           push_type: Optional[NotificationType] = None) -> None:
         notification_coro = self.send_notification_async(token_hex, notification, topic, priority, expiration, collapse_id, push_type)
         result = asyncio.run(notification_coro)
-        if not result.success:
-            if isinstance(result.error, tuple):
-                reason, info = result.error
-                raise exception_class_for_reason(reason)(info)
-            else:
-                raise exception_class_for_reason(result.error)
+        # Proobably don't want to raise an error here, just return the APNResponse like in the async method
+        # if not result.success:
+        #     if isinstance(result.error, tuple):
+        #         reason, info = result.error
+        #         raise exception_class_for_reason(reason)(info)
+        #     else:
+        #         raise exception_class_for_reason(result.error)
         return result
 
     async def send_notification_async(self, token_hex: str, notification: Payload, topic: Optional[str] = None,
@@ -160,18 +161,11 @@ class APNsClient(object):
         Get result for specified stream
         The function returns: 'Success' or 'failure reason' or ('Unregistered', timestamp)
         """
-        # TODO: Clean this up
-        #       Also improve error handling, return actual error object
         if response.status_code == 200:
             return APNResponse(response.status_code, token, True)
         else:
-            # raw_data = response.read().decode('utf-8')
             raw_data = response.text
             data = json.loads(raw_data)  # type: Dict[str, str]
-            # if response.status == 410:
-            #     return data['reason'], data['timestamp']
-            # else:
-            #     return data['reason']
             return APNResponse(response.status_code, token, False, data['reason'])
 
     def send_notification_batch(self, notifications: Iterable[Notification], topic: Optional[str] = None,
@@ -185,9 +179,7 @@ class APNsClient(object):
                                             expiration: Optional[int] = None, collapse_id: Optional[str] = None,
                                             push_type: Optional[NotificationType] = None) -> Dict[str, Union[str, Tuple[str, str]]]:
         """
-        Send a notification to a list of tokens in batch. Instead of sending a synchronous request
-        for each token, send multiple requests concurrently. This is done on the same connection,
-        using HTTP/2 streams (one request per stream).
+        Send a notification to a list of tokens asynchronously.
 
         APNs allows many streams simultaneously, but the number of streams can vary depending on
         server load. This method reads the SETTINGS frame sent by the server to figure out the
@@ -197,71 +189,20 @@ class APNsClient(object):
         if the token was sent successfully, or the string returned by APNs in the 'reason' field of
         the response, if the token generated an error.
         """
-        notification_iterator = iter(notifications)
-        next_notification = next(notification_iterator, None)
+
+        requests = []
+        for notification in notifications:
+            requests.append(
+                self.send_notification_async(notification.token, notification.payload, topic,
+                                             priority, expiration, collapse_id, push_type))
+            )
+
+        logger.info('Finished sending all tokens, waiting for pending requests.')
 
         results = []
-        open_streams = set()
-        pending_streams = asyncio.queues.Queue()
-        # open_streams = collections.deque()  # type: typing.Deque[RequestStream]
-
-        def _on_completion(notification_task):
-            open_streams.discard(notification_task)
-            pending_streams.put_nowait(notification_task)
-
-        # Loop on the tokens, sending as many requests as possible concurrently to APNs.
-        # When reaching the maximum concurrent streams limit, wait for a response before sending
-        # another request.
-        while len(open_streams) > 0 or next_notification is not None:
-            # Update the max_concurrent_streams on every iteration since a SETTINGS frame can be
-            # sent by the server at any time.
-            # TODO: # self.update_max_concurrent_streams()
-            if next_notification is not None and len(open_streams) < self.__max_concurrent_streams:
-                logger.info('Sending to token %s', next_notification.token)
-                notification_task = asyncio.create_task(
-                    self.send_notification_async(next_notification.token, next_notification.payload, topic,
-                                                 priority, expiration, collapse_id, push_type))
-                open_streams.add(notification_task)
-                notification_task.add_done_callback(_on_completion)
-
-                next_notification = next(notification_iterator, None)
-                if next_notification is None:
-                    # No tokens remaining. Proceed to get results for pending requests.
-                    logger.info('Finished sending all tokens, waiting for pending requests.')
-            else:
-                # We have at least one request waiting for response (otherwise we would have either
-                # sent new requests or exited the while loop.) Wait for the first outstanding stream
-                # to return a response.
-                pending_stream = await pending_streams.get()
-                result = pending_stream.result()
-                logger.info('Got response for %s: %s', result.token, "Success" if result.success else result.error)
-                results.append(result)
+        for request in asyncio.as_completed(requests):
+            result = await request
+            logger.info('Got response for %s: %s', result.token, "Success" if result.success else result.error)
+            results.append(result)
 
         return results
-
-    # TODO: 
-    def update_max_concurrent_streams(self) -> None:
-        # Get the max_concurrent_streams setting returned by the server.
-        # The max_concurrent_streams value is saved in the H2Connection instance that must be
-        # accessed using a with statement in order to acquire a lock.
-        # pylint: disable=protected-access
-        with self._connection._conn as connection:
-            max_concurrent_streams = connection.remote_settings.max_concurrent_streams
-
-        if max_concurrent_streams == self.__previous_server_max_concurrent_streams:
-            # The server hasn't issued an updated SETTINGS frame.
-            return
-
-        self.__previous_server_max_concurrent_streams = max_concurrent_streams
-        # Handle and log unexpected values sent by APNs, just in case.
-        if max_concurrent_streams > CONCURRENT_STREAMS_SAFETY_MAXIMUM:
-            logger.warning('APNs max_concurrent_streams too high (%s), resorting to default maximum (%s)',
-                           max_concurrent_streams, CONCURRENT_STREAMS_SAFETY_MAXIMUM)
-            self.__max_concurrent_streams = CONCURRENT_STREAMS_SAFETY_MAXIMUM
-        elif max_concurrent_streams < 1:
-            logger.warning('APNs reported max_concurrent_streams less than 1 (%s), using value of 1',
-                           max_concurrent_streams)
-            self.__max_concurrent_streams = 1
-        else:
-            logger.info('APNs set max_concurrent_streams to %s', max_concurrent_streams)
-            self.__max_concurrent_streams = max_concurrent_streams
