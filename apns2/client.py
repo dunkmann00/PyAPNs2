@@ -194,7 +194,7 @@ class APNsClient(object):
         for notification in notifications:
             requests.append(
                 self.send_notification_async(notification.token, notification.payload, topic,
-                                             priority, expiration, collapse_id, push_type))
+                                             priority, expiration, collapse_id, push_type)
             )
 
         logger.info('Finished sending all tokens, waiting for pending requests.')
