@@ -27,9 +27,9 @@ class Credentials(object):
         proxies = None
         if proxy_host is not None:
             proxy_url = URL(host=proxy_host, scheme='https', port=proxy_port)
-            proxies = { 'all://': proxy_url }
+            proxy_mounts = { 'all://': proxy_url }
 
-        return AsyncClient(verify=self.__ssl_context or True, http1=False, http2=True, proxies=proxies, base_url=apns_url)
+        return AsyncClient(verify=self.__ssl_context or True, http1=False, http2=True, mounts=proxy_mounts, base_url=apns_url)
 
     def get_authorization_header(self, topic: Optional[str]) -> Optional[str]:
         return None
