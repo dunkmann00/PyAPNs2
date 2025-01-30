@@ -24,7 +24,7 @@ class Credentials(object):
                           proxy_port: Optional[int] = None) -> AsyncClient:
         apns_url = URL(host=server, scheme='https', port=port)
 
-        proxies = None
+        proxy_mounts = None
         if proxy_host is not None:
             proxy_url = URL(host=proxy_host, scheme='https', port=proxy_port)
             proxy_mounts = { 'all://': proxy_url }
